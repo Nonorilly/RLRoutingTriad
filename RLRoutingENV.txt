@@ -1,0 +1,100 @@
+routine RLRoutingENV(InOut Con[100])[Real Alpha; Real Gamma; String Paths]
+initial
+  // параметр Paths должен быть вида: кол-во событий]откуда, куда, время события, кол-во сообщ.|откуда, куда, время, кол-во|... 
+  // в порядке ВОЗРАСТАНИЯ времени события, системное ограничение
+  array[100,2] of Integer Nodes; // Список узел-выход
+  array[100,5] of Integer Events; // Таблица вида: [откуда, куда, время события, кол-во сообщ, выход]
+  Integer cnt_nodes := 0, cnt_events, curr_events; // Счетчики
+  Real T := 20; // период актуализации сети HP сообщениями
+  // Структуры для сообщений
+  String msg := "";
+  array[10] of string ArrMsg;
+  
+  // Вспомогательные переменные
+  Integer i:=0, j:=0, k:=0; // Индексы для циклов
+  Integer maxConVal := 99; // Максимальное количество связей по полюсам (в циклах обработки полюсов)
+  array[100] of String Str_events; // "сырой" вид параметров для каждого события отправки сообщ. (строки)
+  array[4] of String Event_params; // временный массив для параметров
+  array[2] of String Str0_events;
+  Integer cnt_str_events := 0;
+  schedule Init_network in 0; // инициализация всех узлов в сети для управляющего узла
+  schedule Parse_Paths in 0.01; // разбор входного параметра с путями в виде таблицы, после инициализации узлов
+  schedule Init_start in 0.01; // запуск регулярного события для всех узлов с обменом HP сообщений
+endi
+
+
+event;
+  ArrMsg := Split(message, '|');
+  
+  if ArrMsg[0] = "CFG-REP" then 
+    Nodes[cnt_nodes, 0] := StrToInt(ArrMsg[1]); // от кого
+    for i:=0 to maxConVal do // определить выход, с какого было получено сообщение CFG-REP
+      case
+      Con[i]:
+        Nodes[cnt_nodes, 1] := i; // номер выхода			
+      endc;
+    endf;
+    cnt_nodes := cnt_nodes + 1;
+  endif;
+ende
+
+
+event Init_network;
+  // отправляется всем широковещательно сообщение с коэф-ами и ожидается ответное для определения пары выход-узел
+  msg := "CFG|" + RealToStr(Alpha) + "|" + RealToStr(Gamma); 
+  for i:=0 to maxConVal do // рассылка всем доступным соседям
+    out msg through Con[i];
+  endf;
+ende
+
+event Init_start;
+  // отправляется всем широковещательно управляющее сообщение
+  msg := "INIT"; //|" + RealToStr(T); 
+  for i:=0 to maxConVal do // рассылка всем доступным соседям
+    out msg through Con[i];
+  endf;
+  schedule Init_start in T;
+ende
+
+event Parse_Paths;
+  if Paths != "" then
+    Str0_events := Split(Paths, ']'); // кол-во + события
+    cnt_str_events := StrToInt(Str0_events[0]);
+    Str_events := Split(Str0_events[1], '|'); // только события
+    
+    for i:=0 to cnt_str_events-1 do
+      if Str_events[i] != "" then
+        Print "Разбираю запланированное событие: " + Str_events[i];
+        Event_params := Split(Str_events[i], ',');
+        Events[i, 0] := StrToInt(Event_params[0]); // откуда
+        Events[i, 1] := StrToInt(Event_params[1]); // куда
+        Events[i, 2] := StrToInt(Event_params[2]); // время
+        Events[i, 3] := StrToInt(Event_params[3]); // кол-во
+        for k:=0 to cnt_nodes-1 do
+          if Events[i, 0] = Nodes[k, 0] then
+            Events[i, 4] := Nodes[k, 1]; // выход
+          endif;
+        endf;
+        cnt_events := cnt_events + 1;
+      endif;
+    endf;
+    
+    if cnt_events > 0 then // начинается процесс отправки "заданий" узлам
+      curr_events := 0;
+      schedule Send_Node_event in Events[curr_events, 2]; 
+    endif;
+  endif;
+ende
+
+event Send_Node_event; 
+// в сообщении не нужно указывать получателя - он определяется выходом, время события - 
+// узел сразу спланирует событие обновления Dest и начнет поиск пути 
+  msg := "EV|" + IntToStr(Events[curr_events, 1]) + "|" + IntToStr(Events[curr_events, 3]);
+  out msg through Con[Events[curr_events, 4]];
+  curr_events := curr_events + 1;
+  if curr_events < cnt_events then
+    schedule Send_Node_event in Events[curr_events, 2]-Events[curr_events-1, 2]; // поскольку планирование ЧЕРЕЗ интервал, а не В определенное время
+  endif;
+ende
+
+endrout

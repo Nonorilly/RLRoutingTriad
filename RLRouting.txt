@@ -1,0 +1,540 @@
+routine RLRouting(InOut Con[100])[Integer Id; Real StartEnergyLevel; Real StartX; Real StartY]
+initial
+  // все в основном ограничено 100 соседями, при необходимости - изменить размерность массивов, maxConVal
+  array[100,3] of Real Q; // q-values соседей (чье, значение, выход)
+  array[100,2] of Integer Rep_sndr; // Список узлов, которым нужно будет отправить REP пакет (кому, выход)
+  array[100,3] of Integer Rep_inp; // Список узлов, от которых получен REP пакет (от кого, выход, кол-во шагов)
+  array[100,2] of Integer Err_sndr; // Список узлов, которым необходимо вернуть ERR пакет (кому, выход), когда отправляем - запоминаем
+  array[100,2] of Integer Err_inp; // Список узлов, которые прислали пакет ERR (кому, выход), когда получаем пакет - запоминаем
+  array[100,2] of Integer Data_inp; // Список узлов, которые прислали пакет DATA (от кого, выход)
+  array[100,2] of Integer Routing_table; Integer cnt_rout := 0; // Таблица маршрутизации (кому, nexthop, выход)
+  Integer cnt_rep := 0, cnt_req := 0, cnt_inp := 0, cnt_errInp := 0, cnt_errSndr := 0, cnt_dataInp; // счетчики для списков выше
+  Integer cnt_n := 0; // кол-во соседей
+  Integer R; // reward
+  Real alpha:=0, gamma:=0; // coefs 
+  Real nexthop:= -1; // id следующего узла в маршруте для пакета данных
+  Real energyLevel; // пока уровень без изменений во времени
+  energyLevel := StartEnergyLevel;
+  Real energyConsumption := 0.001; // потребление на отправку сообщения, 0.1% от EnergyLevel (%)
+  Real x,y;
+  x := StartX; y := StartY; // начальное положение - из параметров
+  Real radius := 5.0; // радиус действия узла
+  Integer state := 0, source_id := -1;
+  Integer packet_count := 0; // количество пакетов для отправки у узла
+  Integer curr_packet := 1, curr_dest := 0, curr_packet_count := 0; // текущий номер отправляемого пакета, целевой узел, кол-во пакетов
+  Integer dest := -1; // получатель пакета
+  // Структуры для сообщений
+  String msg := "";
+  array[10] of string ArrMsg;
+  
+  // Вспомогательные переменные
+  Integer i:=0, j:=0, k:=0; // Индексы для циклов
+  Integer maxConVal := 99; // Максимальное количество связей по полюсам (в циклах обработки полюсов)
+  Boolean isPlanned := false, isFinded := false, toRemove := true;
+  Real maxQ := -10000; // макс q соседей (от кого получили REP) -> для пересчета q
+  Real minQ := 10000; // мин q соседей -> для определения следующего шага
+  Integer prevHC:=10000;
+  Real rcv_rep_time := 0; // для корректного времени ожидания всех входящих REP пакетов
+  Array[10] of String ChangeData; String tmp_message := "";
+  // Временное буферное хранилище сообщений, так как маршрут может достраиваться в середине, а сообщение от предыдущих
+  // уже пришло ранее. Нужно сохранить до момента построения дальнейшего маршрута и их пересылки.
+  array[100] of String Tmp_Data; Integer cnt_tmpdata := 0; 
+  for i:=0 to maxConVal do
+    Routing_table[i, 1] := -1;
+    Data_inp[i, 1] := -1;
+  endf;
+endi
+
+// main() function
+// ! работа с input message
+event;
+  ArrMsg := Split(message, '|');
+  // сообщения от "среды" обрабатываются отдельно
+  if ArrMsg[0] = "CFG" then // начальное сообщение с коэф-ами для Q-learning + ответное сообщение
+    alpha := StrToReal(ArrMsg[1]);
+    gamma := StrToReal(ArrMsg[2]);
+    msg := "CFG-REP|" + IntToStr(Id);
+    for i:=0 to maxConVal do // определить выход узла-"окружения"
+      case
+        Con[i]:
+          out msg through Con[i];			
+        endc;
+    endf;
+  endif;
+  
+  if ArrMsg[0] = "INIT" then // периодическое событие рассылки HP и обновления инф-ии о сети
+    schedule Reset_Memory in 0;
+    schedule Init in 0.0001;
+  endif;
+  
+  if ArrMsg[0] = "EV" then // извне получено задание на отправку пакетов для этого узла
+    dest := StrToInt(ArrMsg[1]);
+    packet_count := StrToInt(ArrMsg[2]);
+    schedule Send_Data in 0; // планируем сразу, тк нужное время уже достигнуто
+  endif;
+  
+  // если мы должны получить сообщение в силу удаленности отправителя и радиуса действия
+  // теперь в arrmsg на 0 и 1 месте всегда координаты отправителя
+  // сообщения принимаются ТОЛЬКО в том случае, если заряда достаточно (>3%)
+  if ((ArrMsg[0] != "CFG") & (ArrMsg[0] != "INIT") & (ArrMsg[0] != "EV")) then  // сообщение получено от узла сети, а не окружения
+    if (Sqrt(Pow(StrToReal(ArrMsg[0])-x, 2) + Pow(StrToReal(ArrMsg[1])-y, 2)) < 2*radius) & (energyLevel > 0.03) then
+    
+      if ArrMsg[2] = "HP" then
+        Print IntToStr(Id) + "| HP pack was recieved | fromid: " + ArrMsg[3];
+        Q[cnt_n, 0] := StrToInt(ArrMsg[3]); // от кого
+        Q[cnt_n, 1] := StrToReal(ArrMsg[5]); // Q-value на основании текущего уровня энергии
+        for i:=0 to maxConVal do // определить выход
+        case
+          Con[i]:
+            Q[cnt_n, 2] := i;				
+          endc;
+        endf;
+        if cnt_n = 0 then // единожды
+          schedule Update_Routingtable in 0.001; 
+        endif;
+        cnt_n := cnt_n + 1;
+      endif;
+
+      if state = 1 then  // 1 - (wait REQ/DATA)
+        if ArrMsg[2] = "DATA" then
+          Print IntToStr(Id) + "| DATA pack was recieved | " + ArrMsg[4] + "/"+ ArrMsg[5];
+          if StrToInt(ArrMsg[3]) != Id then // получатель не мы - пересылаем дальше по оптимальному маршруту
+            // Учитываем, что данные могут прийти, а дальнейшего маршрута нет -> нужно исключить запрос маршрута у предыдущего узла
+            // иначе возможна ситуация с циклом
+            Data_inp[cnt_dataInp, 0] := StrToInt(ArrMsg[6]); // id текущего отправителя пакета
+            for i:=0 to maxConVal do // определить выход
+            case
+              Con[i]:
+                Data_inp[cnt_dataInp, 1] := i;				
+              endc;
+            endf;
+            cnt_dataInp := cnt_dataInp + 1;
+            curr_dest := StrToInt(ArrMsg[3]); // достаем инф-ю из сообщения для пересылки
+            // Здесь необходимо проверить маршрут в таблице, если его нет - закэшировать сообщение на время построения маршрута
+            // После построения и появления в таблице - очистить этот кэш
+            for i:=0 to cnt_rout-1 do
+              if (Routing_table[i, 0] = StrToInt(ArrMsg[3])) & (Routing_table[i, 1] != -1) then
+                //curr_packet := StrToInt(ArrMsg[4]);
+                curr_packet_count := StrToInt(ArrMsg[5]);
+                schedule Send_Data_Packet in RandomRealIn(10,1000)*0.00001;
+                isFinded := true;
+              endif;
+            endf;
+            
+            if !isFinded then
+              ChangeData := Split(message, '|');
+              ChangeData[0] := RealToStr(x); // координаты и номер узла у кэшированного должны соответствовать тому узлу, который их переправит
+              ChangeData[1] := RealToStr(y);
+              ChangeData[6] := IntToStr(Id);
+              for i:=0 to 7 do
+                tmp_message := tmp_message + ChangeData[i] + "|" ;
+              endf;   
+              Tmp_Data[cnt_tmpdata] := tmp_message;
+              tmp_message := "";
+              if cnt_tmpdata = 0 then // чтобы событие было запланировано только один раз при нескольких сообщениях
+                schedule Send_REQ_Packet in 0.15;
+                dest := StrToInt(ArrMsg[3]);
+              endif;
+              cnt_tmpdata := cnt_tmpdata + 1;
+            endif;
+            isFinded := false;
+            
+            if StrToInt(ArrMsg[4]) = 1 then
+              curr_packet := 1;
+            endif;
+          else
+            Print "Пришел пакет с данными:" + ArrMsg[7];
+          endif; // check id
+        endif;
+        
+        if ArrMsg[2] = "REQ" then 
+          Print IntToStr(Id) + "| REQ pack was recieved | hc = " + ArrMsg[5] + " | fromid: " + ArrMsg[6];   
+          // ситуация, когда соединение нестабильно и формируется пакет ERR, отправляется запросившему REQ
+          // Если остаток энергии слишком низкий для пересылки (<5%)
+          if energyLevel < 0.05 then
+            msg := RealToStr(x) + "|" + RealToStr(y) + "|ERR|" + IntToStr(Id) + "|" + ArrMsg[5];
+            Err_sndr[cnt_errSndr, 0] := StrToInt(ArrMsg[6]); // от кого REQ и кому ERR
+            for i:=0 to maxConVal do // определить выход
+            case
+              Con[i]:
+                Err_sndr[cnt_errSndr, 1] := i;				
+              endc;
+            endf;
+            cnt_errSndr := cnt_errSndr + 1;
+            schedule Send_ERR_Packet in 0.1 + RandomRealIn(0,0.01); // исключаем ситуацию, когда в один момент времени возникнут ошибки
+                                                                    // предназначенные разным узлам
+          else    
+            // если не мы получатель
+            curr_dest := StrToInt(ArrMsg[4]);
+            if curr_dest != Id then
+              // проверим на наличие записи в таблице маршрутизации
+              for i:=0 to cnt_rout-1 do
+                if (Routing_table[i, 0] = curr_dest) & (Routing_table[i, 1] != -1) then // есть запись в таблице, REP формируем от себя
+                  source_id := StrToInt(ArrMsg[3]);
+                  schedule FinishREQ in 1.5;
+                  schedule Send_REP_Packet in 2;
+                  isFinded := true;
+                endif;
+              endf;
+              if !isFinded then
+                if !isPlanned then 
+                  schedule Resend_REQ_Packet in 1;
+                  isPlanned := true;
+                endif;
+                // после получения всех пакетов - отослать с минимальным hc
+                if prevHC > StrToInt(ArrMsg[5]) then
+                  prevHC := StrToInt(ArrMsg[5]);
+                endif;
+                msg := RealToStr(x) + "|" + RealToStr(y) + "|REQ|" + ArrMsg[3] + "|" + ArrMsg[4] + "|" + IntToStr(prevHC+1) 
+                + "|" + IntToStr(Id);        
+              endif;
+              isFinded := false;
+               
+            else
+              // пакет для нас, формируем ответный
+              source_id := StrToInt(ArrMsg[3]);
+              schedule Send_REP_Packet in 2;
+            endif;
+            
+            Rep_sndr[cnt_rep, 0] := StrToInt(ArrMsg[6]); // от кого
+            for i:=0 to maxConVal do // определить выход, с какого было получено сообщение
+              case
+              Con[i]:
+                Rep_sndr[cnt_rep, 1] := i; // номер выхода, откуда получен REQ и куда высылать REP				
+              endc;
+            endf;
+            cnt_rep := cnt_rep + 1;
+           
+          endif;  
+        endif; // REQ msg
+
+      endif; // state 1
+      
+      if state = 2 then  // 2 - (wait REP or ERR)
+        if ArrMsg[2] = "REP" then
+          Print IntToStr(Id) + "| REP pack was recieved | hc = " + ArrMsg[5] + " | fromid: "+ ArrMsg[7];
+          if !isPlanned then 
+            schedule Recalc_Q_values in 0; 
+            schedule Make_Decision in 0.05;
+            schedule Add_Routingtable in 0.1;
+            schedule FinishREP in 0.01+rcv_rep_time; 
+            if StrToInt(ArrMsg[3]) != Id then 
+              rcv_rep_time := 0.1+0.1*(cnt_n - cnt_rep);
+              schedule Resend_REP_Packet in rcv_rep_time;
+            else
+              schedule Send_Cached_Data in 0.3;  
+            endif;
+            isPlanned := true;
+          endif;
+      // после получения всех пакетов - отослать с минимальным hc
+          if prevHC > StrToInt(ArrMsg[5]) then
+            prevHC := StrToInt(ArrMsg[5]);
+          endif;
+            
+          msg := RealToStr(x) + "|" + RealToStr(y) + "|REP|" + ArrMsg[3] + "|" + ArrMsg[4] + "|" 
+          + IntToStr(prevHC+1) + "|" + RealToStr(energyLevel) + "|" + IntToStr(Id);
+
+          Rep_inp[cnt_inp, 0] := StrToInt(ArrMsg[7]); // от кого
+          for i:=0 to maxConVal do // определить выход, с какого было получено сообщение REP
+            case
+            Con[i]:
+              Rep_inp[cnt_inp, 1] := i; // номер выхода, откуда получен REP и для кого пересчитывать Q-val			
+            endc;
+          endf;
+          Rep_inp[cnt_inp, 2] := StrToInt(ArrMsg[5]); // кол-во шагов до текущего узла (от получателя)
+          cnt_inp := cnt_inp + 1;
+        endif;
+        
+        // пришло сообщение-ошибка, перестраиваем маршрут через остальных соседей, 
+        // или рассылаем заново REQ (если аналогичного пути нет)
+        if ArrMsg[2] = "ERR" then 
+        // если вдруг придут ошибки от всех далее идущих узлов - нужно запустить новую рассылку REQ.
+          if (cnt_req != 0) & (cnt_req = cnt_errInp) then
+            Print IntToStr(Id) + "| Невозможно построить маршрут далее. Запуск новой рассылки REQ.";
+            msg := RealToStr(x) + "|" + RealToStr(y) + "|REQ|" + ArrMsg[3] + "|" + ArrMsg[4] + "|" + IntToStr(prevHC+1) 
+            + "|" + IntToStr(Id); 
+            schedule Resend_REQ_Packet in 0.1;
+          endif;         
+          Print IntToStr(Id) + "| ERR pack was recieved | hc = " + ArrMsg[4] + " | fromid: " + ArrMsg[3];   
+          Err_inp[cnt_errInp, 0] := StrToInt(ArrMsg[3]); // от кого
+          for i:=0 to maxConVal do
+            case
+            Con[i]:
+              Err_inp[cnt_errInp, 1] := i; // номер выхода
+            endc;
+          endf;
+          // теперь в Err_inp хранится инф-я об узлах, которые надо избегать.
+          cnt_errInp := cnt_errInp + 1;
+        endif; // ERR msg
+        
+      endif; // state=2
+         
+    endif; // проверка на расстояние
+  
+  endif; // проверка на служебное сообщ
+ende
+
+event Init;
+  schedule Move in 19.99;
+  msg := RealToStr(x) + "|" + RealToStr(y) + "|HP|" + IntToStr(Id) + "|1|" + RealToStr(energyLevel);
+  if (energyLevel >= 0.03) then
+    for i:=0 to maxConVal do // рассылка всем доступным соседям
+      out msg through Con[i];
+    endf;
+    energyLevel := energyLevel - energyConsumption; // поскольку сообщение широковещательное и одиночное, то тратится энергия единожды.
+  else
+    Print "Я разряжен";
+  endif;
+  schedule FinishInit in 0.5;
+ende
+
+event FinishInit;
+  state := 1;
+ende
+
+event FinishREQ;
+  state := 1;
+ende
+
+event FinishREP;
+  state := 1;
+ende
+
+// Отправка пакета-запроса (REQ) получателю по сети
+event Send_REQ_Packet; // для "отправителя"
+  schedule Timeout_REQ_Packet in 100; // !временно выключено
+  msg := RealToStr(x) + "|" + RealToStr(y) + "|REQ|" + IntToStr(Id) + "|" + IntToStr(dest) + "|1|" + IntToStr(Id);
+    for i:=0 to maxConVal do // рассылка соседям идущим "далее", рассылка - всем, обработка - только принимающим
+      if cnt_dataInp > 0 then
+        for j:=0 to cnt_dataInp-1 do
+          if Data_inp[j, 1] != i then
+            out msg through Con[i];
+          endif;
+        endf;
+      else
+        out msg through Con[i];
+      endif;
+    endf;
+  energyLevel := energyLevel - energyConsumption * cnt_n;
+  state := 2; // после рассылки req - в состояние ожидания ответа (REP)
+ende
+
+event Resend_REQ_Packet; // для остальных
+  // запустим событие-таймаут для ожидания REQ пакета во время отправки REQ.
+  schedule Timeout_REQ_Packet in 100; // !временно выключено
+  for i:=0 to maxConVal do // рассылка соседям идущим "далее", рассылка - всем, обработка - только принимающим
+    if cnt_dataInp > 0 then
+      for j:=0 to cnt_dataInp-1 do
+        if Data_inp[j, 1] != i then
+          out msg through Con[i];
+        endif;
+      endf;
+    else
+      out msg through Con[i];
+    endif;
+  endf;
+  energyLevel := energyLevel - energyConsumption * (cnt_n-cnt_rep);
+  state := 2;
+  isPlanned := false;
+  prevHC := 10000;
+ende
+
+// Пакет достиг получателя, отправка ответного пакета (REP) в обратную сторону
+event Send_REP_Packet; // для "получателя" (отправляющего пакет)
+  msg := RealToStr(x) + "|" + RealToStr(y) + "|REP|" + IntToStr(source_id) + "|" + IntToStr(Id) + "|1|" 
+  + RealToStr(energyLevel) + "|" + IntToStr(Id);
+  for i:=0 to cnt_rep-1 do 
+    if cnt_errSndr = 0 then // если ошибок нет - отправка без проверки вообще
+      out msg through Con[Rep_sndr[i,1]];
+      energyLevel := energyLevel - energyConsumption;
+    else
+      for k:=0 to cnt_errSndr-1 do
+        if i != Err_sndr[k, 1] then // если мы уже не отправили ERR пакет
+          out msg through Con[i];
+          energyLevel := energyLevel - energyConsumption;
+        endif;
+      endf;
+    endif;
+  endf;
+  state := 1; // не требуется ожидание (REP)
+ende
+
+event Resend_REP_Packet; // для остальных
+  for i:=0 to cnt_rep-1 do // рассылка всем доступным далее соседям
+    out msg through Con[Rep_sndr[i,1]];
+    energyLevel := energyLevel - energyConsumption;
+  endf;
+  state := 1;
+  isPlanned := false;
+  isFinded := false;
+ende
+
+event Recalc_Q_values;
+  // ищем максимум из q-values от тех соседей, от которых получили REP
+  // ! изначальный q-val учитывает hopcount до узла
+  for i:=0 to cnt_inp-1 do
+    for j:=0 to cnt_n-1 do
+      if Rep_inp[i, 0] = Q[j, 0] then
+        Q[j, 1] := Q[j, 1] * Rep_inp[i, 2];
+        if Q[j, 1] > maxQ then
+          maxQ := Q[j, 1];
+        endif;
+      endif;
+    endf;
+  endf;
+
+  // Считаем новое значение Q для узлов, участвующих в пути
+  for i:=0 to cnt_inp-1 do
+    if Rep_inp[i, 2]=1 then // непосредственные соседи
+      R:=-100;
+    else
+      R:=0;
+    endif;
+    for j:=0 to cnt_n-1 do
+      if Rep_inp[i, 0] = Q[j, 0] then // обновляем значения только нужных соседей, что участвуют в обмене
+        Q[j, 1] := Q[j, 1] + alpha*(R + gamma*(maxQ - Q[j, 1]));
+        Print "Q-value[" + IntToStr(Id) + ", " + RealToStr(Q[j,0]) + "] = " + RealToStr(Q[j,1]);
+      endif;
+    endf;
+  endf;
+  maxQ:=-10000;
+ende
+
+event Make_Decision;
+  // выносим решение о лучшем маршруте
+  minQ:=10000; nexthop := -1;
+  for i:=0 to cnt_inp-1 do
+    for j:=0 to cnt_n-1 do
+      if (Rep_inp[i, 0] = Q[j, 0]) & (Q[j, 1] < minQ) then
+        minQ := Q[j, 1];
+        nexthop := Q[j, 0];
+      endif;
+    endf;
+  endf;
+ende
+
+
+event Timeout_REQ_Packet;
+  if state = 2 then
+    schedule Resend_REQ_Packet in 0.1;
+  endif;
+ende
+
+event Add_Routingtable; // вносим в таблицу маршрутизации новый путь
+  Routing_table[cnt_rout, 0] := curr_dest;
+  Routing_table[cnt_rout, 1] := (Integer)nexthop;
+  cnt_rout := cnt_rout + 1;
+ende
+
+event Update_Routingtable; // обновляем, если связь была нарушена
+  for i:=0 to cnt_rout-1 do
+    toRemove := true;
+    for j:=0 to cnt_n-1 do
+      if Routing_table[i, 1] = Q[j, 0] then
+        toRemove := false;
+      endif;
+    endf;
+    if toRemove then
+      Routing_table[i, 1] := -1;
+    endif;
+  endf;
+ende
+
+event Send_Cached_Data;
+  for i:=0 to cnt_tmpdata-1 do
+    msg := Tmp_Data[i];
+    for j:=0 to cnt_rout-1 do
+      if (Routing_table[j, 0] = curr_dest) & (Routing_table[j, 1] != -1) then
+        for k:=0 to cnt_n-1 do 
+          if Routing_table[j, 1] = Q[k, 0] then // ищем нужный выход и отправляем пакет далее
+            out msg through Con[(Integer)Q[k, 2]];
+            energyLevel := energyLevel - energyConsumption;
+          endif;
+        endf;
+      endif;
+    endf;
+  endf;
+  cnt_tmpdata := 0;
+ende
+
+event Send_Data;
+  curr_dest := dest;
+  curr_packet_count := packet_count;
+  schedule Data_Timeout in packet_count*10;
+  for i:=0 to cnt_rout-1 do
+    if (Routing_table[i, 0] = curr_dest) & (Routing_table[i, 1] != -1) then
+      isFinded := true;
+    endif;
+  endf;
+  if !isFinded then 
+    // кэшируем
+    for cnt_tmpdata:=0 to packet_count-1 do
+      Tmp_Data[cnt_tmpdata] := RealToStr(x) + "|" + RealToStr(y) + "|DATA|" + IntToStr(curr_dest) + 
+      "|" + IntToStr(curr_packet) + "|" + IntToStr(curr_packet_count)+ "|" + IntToStr(Id) + "|Какие-то данные";
+      curr_packet := curr_packet + 1;
+    endf;
+    schedule Send_REQ_Packet in 0.15;
+  else
+    curr_packet:=1;
+    for i:=0 to packet_count-1 do
+      schedule Send_Data_Packet in (i+1)*0.00001+RandomRealIn(10,1000)*0.00001;
+    endf;
+  endif;
+  isFinded := false;
+ende
+
+event Send_Data_Packet; // Отправка пакетов с данными для отправителя
+  msg := RealToStr(x) + "|" + RealToStr(y) + "|DATA|" + IntToStr(curr_dest) + "|" + IntToStr(curr_packet) 
+  + "|" + IntToStr(curr_packet_count) + "|" + IntToStr(Id) + "|Какие-то данные";
+  for i:=0 to cnt_rout-1 do
+    if (Routing_table[i, 0] = curr_dest) & (Routing_table[i, 1] != -1) then
+      for k:=0 to cnt_n-1 do 
+        if Routing_table[i, 1] = Q[k, 0] then // ищем нужный выход и отправляем пакет далее
+          out msg through Con[(Integer)Q[k, 2]];
+          curr_packet := curr_packet + 1;
+          energyLevel := energyLevel - energyConsumption;
+        endif;
+      endf;
+    endif;
+  endf;
+
+ende
+
+event Data_Timeout;
+    schedule Reset_Memory in 0.5;
+ende
+
+event Reset_Memory;
+  // нужно сбросить инф-ю о текущих соседях, вспомогательные массивы.
+  isPlanned := false;
+  cnt_n:=0;
+  cnt_req := 0;
+  cnt_inp := 0; cnt_rep := 0;
+  cnt_errInp := 0; cnt_errSndr := 0;
+  if dest != -1 then
+    dest := -1;
+  endif;
+  packet_count := 0; curr_packet := 1; curr_dest:=0; curr_packet_count:=0; cnt_dataInp:=0; nexthop := -1;
+  state := 1;
+  for i:=0 to maxConVal do
+    Data_inp[i, 1] := -1;
+  endf;
+ende
+
+event Send_HP_Packet; // пока не используется
+  msg := RealToStr(x) + "|" + RealToStr(y) + "|HP|" + IntToStr(Id) + "|1|" + RealToStr(energyLevel);
+ende
+
+event Send_ERR_Packet; 
+  out msg through Con[Err_sndr[cnt_errSndr-1,1]];
+  energyLevel := energyLevel - energyConsumption;
+ende
+
+event Move;
+  x:= RandomIn(-10,10)*RandomRealIn(0,1)+x;
+  y:= RandomIn(-10,10)*RandomRealIn(0,1)+y;
+  Print IntToStr(Id) + " | переместился на (" + RealToStr(x) + ", " + RealToStr(y) + ")";
+  schedule Move in 19.99;
+ende
+
+endrout
